@@ -1,0 +1,729 @@
+---
+title: "JamesHu_Forecasting_Corn_Yields"
+output: html_document
+date: "2025-01-23"
+---
+
+```{r}
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(lubridate)
+```
+
+```{r}
+#1 - QUERYING THE DATA
+URL <- "http://quickstats.nass.usda.gov/api/"
+keys = fromJSON('/Users/jayumshu/Desktop/FALL 2024 SCHOOL/ASM_Fall24/credentials.json')
+apiKey = keys[['usda_quickstat_key']]
+#This apiKey variable will be used to authenticate requests made to the USDA QuickStats API 
+
+params <- list(param="class_desc",
+               key=apiKey)
+#Classification description 
+out <- GET(paste(URL, "get_param_values", sep=""),
+           query=params)
+#Sends a GET request to USDA QuickStats API 
+#Combines URL with get_param_values
+#query=params appends params list as query parameters in the URL (includes class_desc and key parameters in this case)
+char_content <- rawToChar(out$content)
+
+#Parses JSON content from response (char_content) into an R object 
+data <- fromJSON(char_content)
+data[[params[['param']]]][1:10]
+#^Retrieves first 10 values of the "class_desc" parameter from data 
+
+#Estimate the count of variables
+year_start <- 1950
+year_end <- 2018
+years <- year_start:year_end
+names(years) <- rep('year', length(years))
+short_descs <- c("CORN, GRAIN - ACRES HARVESTED",
+                 "CORN, GRAIN - PRODUCTION, MEASURED IN BU")
+names(short_descs) <- rep('short_desc', length(short_descs))
+#Acres harvested + production for each year 
+
+params <- list(sector_desc="CROPS",
+               commodity_desc="CORN",
+               group_desc="FIELD CROPS",
+               domain_desc="TOTAL",
+               agg_level_desc="STATE",
+               key=apiKey)
+params <- c(years, short_descs, params)
+out = GET(paste(URL, 'get_counts', sep=""),
+          accept_json(),
+          query=params)
+#Combines URL with get_counts endpoint 
+est_rows = content(out)[['count']]
+if(est_rows > 50000){
+    print(paste("too many records, estimating ", est_rows, 
+                " data call will fail"))
+} else {
+    print(paste('Estimated ', est_rows, ' rows of data'))
+}
+
+usda_resp <- GET(url=paste(URL, 'api_GET', sep=""),
+                 query=params)
+usda_resp$status_code == 200
+#^200 status code generally means OK and confirms the API responded successfully 
+data <- content(usda_resp)[['data']]
+#data is a large list of 8354 elements 
+
+headers <- names(data[[1]])
+df <- as.data.frame(do.call(rbind, lapply(data, function(x) unlist(x[headers]))))
+
+dim(df)
+
+constant_vals <- sapply(df, function(x) length(unique(x))) == 1
+df_sans_constants <- df[, !constant_vals]
+#^This removes columns that contain duplicates 
+dim(df_sans_constants)
+#write.csv(df_sans_constants, paste(c("state_level", year_start, year_end, "corn_yield.csv"), collapse="_"), row.names=FALSE)
+
+#CHECK/VIEW
+is_alabama <- df$state_name == "ALABAMA"
+is2017 <- df$year == 2017
+is_area <- df$short_desc == "CORN, GRAIN - ACRES HARVESTED"
+a1 <- df[is_alabama & is2017 & is_area, ]
+dim(a1)
+
+is2018 <- df$year == 2018
+a <- df[is_alabama & is2018 & is_area, ]
+dim(a)
+```
+
+```{r}
+#2 - UNDERSTANDING THE DATA/DATA CLEANING
+df_clear <- df %>%
+  group_by(location_desc) %>%
+  arrange(year, .by_group = TRUE) %>%
+  ungroup()
+
+#NOTE: the same state, year, and variable produce multiple records. On what columns do these records differ by?
+
+print(df_clear[96:98, ])
+#^Take the data above from Alabama 1997 as an example. Row 96 and 98 both record PRODUCTION, MEASURED IN BU. They differ in the source_desc column; one is from the CENSUS (96) and one is from SURVEY (98). 
+
+#A) CLEANING UP COLUMNS
+#Only keeps columns that have at least 1 non-NA value -> 
+df_rem_empty_cols <- df_clear[, colSums(df_clear != "") > 0]
+dim(df_rem_empty_cols)
+
+#Deleting columns where all the observations have the same value -> 
+df_rem_empty_cols <- df_rem_empty_cols[, sapply(df_rem_empty_cols, function(x) length(unique(x)) > 1)]
+dim(df_rem_empty_cols)
+#Removed 25 columns. Dim: 8354 x 14. 
+
+#Getting all the possible values from the following columns (reference_period_desc, short_desc, statisticcat_desc, source_desc) in dataframe -> 
+reference_period_values <- unique(df_rem_empty_cols$reference_period_desc)
+short_desc_values <- unique(df_rem_empty_cols$short_desc)
+statisticcat_desc_values <- unique(df_rem_empty_cols$statisticcat_desc)
+source_desc_values <- unique(df_rem_empty_cols$source_desc)
+state_name_values <- unique(df_rem_empty_cols$state_name)
+
+print(reference_period_values)
+#YEAR, YEAR - AUG FORECAST, YEAR - JUN ACREAGE, YEAR - NOV FORECAST, YEAR - OCT FORECAST, YEAR - SEP FORECAST
+print(short_desc_values)
+print(statisticcat_desc_values)
+print(source_desc_values)
+print(state_name_values)
+#Confirming we have data for all 50 states
+
+#B) RECORDS TO DISCARD?
+#By month reporting seems to only start happening starting from 2012, at least for ALABAMA 
+#Thus, removing the monthly forecasts because we're only interested in ANNUAL corn yield forecasts not forecasts at intermediate points in time
+df_annual_only <- df_rem_empty_cols[df_rem_empty_cols$reference_period_desc == "YEAR", ]
+dim(df_annual_only)
+#6298 x 14
+```
+
+```{r}
+#YIELD = TOTAL PRODUCTION (BU) / ACRES OF LAND HARVESTED (ACRES)
+
+#3 - (Focusing on yield) Evaluating how good the NASS surveys are in predicting the actual reported census values. Considering both length of forecast as well as accuracy. 
+
+#CREATING NEW DATAFRAME FOR SIMPLIFIED VIEW
+df_annual_only_view <- df_annual_only %>%
+  select(state_fips_code, unit_desc, year, short_desc, statisticcat_desc, source_desc, Value, state_name, `CV (%)`)
+
+#OVERVIEW OF CODE:
+ #Filter for separate entries PRODUCTION AND AREA HARVESTED (each of the components of yield)
+ #Merge by year, source_desc, and state
+ #Calculate forecast_yield and census_yield based on source_desc 
+production_data <- df_annual_only %>%
+  filter(statisticcat_desc == "PRODUCTION") %>%
+  select(year, source_desc, state_name, production_value = Value)
+
+area_harvested_data <- df_annual_only %>%
+  filter(statisticcat_desc == "AREA HARVESTED") %>%
+  select(year, source_desc, state_name, area_harvested_value = Value)
+
+#JOINING THE 2 FILTERED DATAFRAMES
+yield_data <- production_data %>%
+  inner_join(area_harvested_data, by = c("year", "source_desc", "state_name"))
+print(yield_data[1:10, ])
+
+
+yield_data$production_value <- as.numeric(gsub(",", "", yield_data$production_value))
+yield_data$area_harvested_value <- as.numeric(gsub(",", "", yield_data$area_harvested_value))
+df_annual_only$Value <- as.numeric(gsub(",", "", df_annual_only$Value))
+
+
+#DEALING WITH PROBLEMATIC ENTRIES
+problematic_rows_yield_data <- yield_data[is.na(yield_data$production_value) | is.na(yield_data$area_harvested_value), ]
+problematic_rows_df_annual_only <- df_annual_only[is.na(df_annual_only$Value), ]
+#Identify problematic rows
+print(problematic_rows_yield_data)
+print(problematic_rows_df_annual_only)
+#Maine 1997 and Rhode Island 1997 
+problematic_years <- c(1997, 2002)
+problematic_sources <- "CENSUS"
+problematic_states <- c("MAINE", "RHODE ISLAND")
+yield_data <- yield_data %>%
+  filter(!(year %in% problematic_years & source_desc %in% problematic_sources & state_name %in% problematic_states))
+df_annual_only <- df_annual_only %>%
+  filter(!(year %in% problematic_years & source_desc %in% problematic_sources & state_name %in% problematic_states))
+
+#CALCULATING YIELD AND ADDING TO ORIGINAL DATAFRAME
+df_annual_only <- df_annual_only %>%
+  left_join(yield_data %>%
+              mutate(
+                #If it's survey data, calculate yield and put value in forecast yield column
+                forecast_yield = ifelse(source_desc == "SURVEY", production_value /area_harvested_value, NA),
+                #If it's census data, calculate yield and put value in census yield column 
+                census_yield = ifelse(source_desc == "CENSUS", production_value / area_harvested_value, NA)
+              ) %>%
+              select(year, state_name, forecast_yield, census_yield),
+            #Join with original data BY year and state_name
+            by = c("year","state_name"))
+
+#CREATING A NEW DATAFRAME FOR YIELD DATA PROCESSING 
+yield_summary_df <- df_annual_only %>%
+  #SELECT RELEVANT COLUMNS FROM df_annual_only for new dataframe 
+  select(year, state_name, forecast_yield, census_yield) %>%
+  #To ensure uniqueness of forecast_yield and census_yield values, group by year and state_name 
+  group_by(year, state_name) %>%
+  #Summarize unique values for each combination of year and state_name 
+  summarize(
+    forecast_yield = first(na.omit(forecast_yield)),
+    census_yield = first(na.omit(census_yield)),
+    .groups = "drop"
+  ) %>%
+  #Replace remaining NA values in forecast_yield or census_yield
+  mutate(
+    forecast_yield = ifelse(is.na(forecast_yield), NA, forecast_yield),
+    census_yield = ifelse(is.na(census_yield), NA, census_yield)
+  )
+
+#Note: for some years, we don't have data for all 50 states
+
+#SORT BY STATE IN ASCENDING ORDER (BY YEAR)
+yield_summary_df <- yield_summary_df %>%
+  group_by(state_name) %>%
+  arrange(year, .by_group = TRUE) %>%
+  ungroup()
+
+#Census years: 1997, 2002, 2007, 2012, 2017
+
+#CALCULATING THE DIFFERENCE
+#For years where census_yield does not equal NA, compute absolute value of the difference between forecast_yield and census_yield in new column abs_error. For years where census_yield does equal NA, leave abs_error blank. 
+yield_summary_df <- yield_summary_df %>%
+  mutate(
+    abs_error = ifelse(!is.na(census_yield), abs(forecast_yield - census_yield), NA)
+  )
+
+yield_summary_plot <- yield_summary_df %>%
+  filter(!is.na(abs_error)) 
+yield_summary_plot$year <- as.double(yield_summary_plot$year)
+
+#VISUALIZATION - of abs_error avg across 50 states for every year
+allstates_error_summary_by_year <- yield_summary_plot %>%
+  group_by(year) %>%
+  summarize(mean_abs_error = mean(abs_error, na.rm = TRUE),
+            se_abs_error = sd(abs_error, na.rm = TRUE) / sqrt(n())
+            ) %>%
+  mutate(
+    lower_ci = mean_abs_error - 1.96 * se_abs_error,
+    upper_ci = mean_abs_error + 1.96 * se_abs_error
+  )
+ggplot(allstates_error_summary_by_year, aes(x = year, y = mean_abs_error)) +
+  geom_point(color = "blue") +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.2) +
+  geom_smooth(method = "lm", se = TRUE, color = "red", linetype = "dashed") +
+  labs(
+    title = "Average Absolute Error Over Time with 95% Confidence Interval",
+    x = "Year",
+    y = "Average Absolute Error for Yield Forecast"
+  ) +
+  theme_minimal()
+
+#Note: Only 41 states are included in the data used for the following visualization 
+```
+
+```{r}
+#4 - CORRELATING CORN PRICES WITH THE NASS DATA
+
+#Price_received = average price received by farmers for a particular commodity; reflects the market value producers received for selling their products
+
+#QUERYING FOR PRICE DATA
+year_start <- 1950
+year_end <- 2017
+years <- year_start:year_end
+names(years) <- rep('year', length(years))
+
+short_descs <- c("CORN, GRAIN - PRICE RECEIVED, MEASURED IN $ / BU")
+names(short_descs) <- rep('short_desc', length(short_descs))
+params <- list(sector_desc="CROPS",
+               commodity_desc="CORN",
+               group_desc="FIELD CROPS",
+               domain_desc="TOTAL",
+               agg_level_desc="STATE",
+               freq_desc = "ANNUAL",
+               key=apiKey)
+params <- c(years, short_descs, params)
+out = GET(paste(URL, 'get_counts', sep=""),
+          accept_json(),
+          query=params)
+est_rows = content(out)[['count']]
+if(est_rows > 50000){
+    print(paste("too many records, estimating ", est_rows, 
+                " data call will fail"))
+} else {
+    print(paste('Estimated ', est_rows, ' rows of data'))
+}
+
+usda_resp <- GET(url=paste(URL, 'api_GET', sep=""),
+                 query=params)
+usda_resp$status_code == 200
+data <- content(usda_resp)[['data']]
+
+headers <- names(data[[1]])
+price_data <- as.data.frame(do.call(rbind, lapply(data, function(x) unlist(x[headers]))))
+
+
+price_data <- price_data %>%
+  group_by(state_name) %>%
+  arrange(year, .by_group = TRUE) %>%
+  ungroup()
+
+constant_vals_price <- sapply(price_data, function(x) length(unique(x))) == 1
+pricedf_sans_constants <- price_data[, !constant_vals_price]
+#UNITS: $ / BU
+
+
+#Attaching to yield_summary_df
+combined_price_df <- yield_summary_df %>%
+  left_join(pricedf_sans_constants %>% select(year, state_name, Value),
+            by = c("year", "state_name")) %>%
+  rename(price_received = Value)
+head(combined_price_df)
+
+
+#Average values across states for each year
+pricedf_sans_constants <- pricedf_sans_constants %>%
+  filter(!is.na(Value))
+pricedf_sans_constants$Value <- as.double(pricedf_sans_constants$Value)
+#print(pricedf_sans_constants[1:100, ])
+allstates_price_summary_by_year <- pricedf_sans_constants %>%
+  group_by(year) %>%
+  summarize(mean_price = mean(Value, na.rm = TRUE))
+#print(allstates_price_summary_by_year)
+combined_price_df$price_received <- as.double(combined_price_df$price_received)
+#problematic_combined_price_df <- combined_price_df[is.na(combined_price_df$price_received), ]
+#print(problematic_combined_price_df)
+
+
+#CORRELATING PRICES
+#Correlation between price_received and forecast_yield 
+cor_forecast <- cor(combined_price_df$price_received, combined_price_df$forecast_yield, use = "complete.obs")
+print(cor_forecast)
+#0.6067004
+
+#Correlation between price_received and census_yield (census years only)
+combined_census_data <- combined_price_df %>%
+  filter(!is.na(census_yield))
+cor_census <- cor(combined_census_data$price_received, combined_census_data$census_yield, use = "complete.obs")
+print(cor_census)
+#0.1062274
+#^INTERPRETATION
+#0.6067004 would indicate a moderate positive correlation between price_received and forecast_yield i.e. as prices increases, forecast yields also tend to increase (to a certain extent)
+#The cor_census value indicate that commodity prices and census yields DO NOT have a strong linear relationship 
+#^This might be AFFECTED BY small sample size though [increases the likelihood of random variations affecting the correlation value]
+#Will focus mainly on forecast_yield values
+
+#State-level correlations
+state_forecast_cor <- combined_price_df %>%
+  group_by(state_name) %>%
+  summarize(
+    cor_forecast = if (sum(!is.na(price_received) & !is.na(forecast_yield)) > 1) {
+      cor(price_received, forecast_yield, use = "complete.obs")
+    } else {
+      NA
+    }
+  )
+
+state_census_cor <- combined_price_df %>%
+  filter(!is.na(census_yield)) %>%
+  group_by(state_name) %>%
+  summarize(
+    cor_census = if (sum(!is.na(price_received) & !is.na(census_yield)) > 1) {
+      cor(price_received, census_yield, use = "complete.obs")
+    } else {
+      NA
+    }
+  )
+
+state_correlations <- left_join(state_forecast_cor, state_census_cor, by = "state_name")
+print(state_correlations)
+
+#Most states have moderately positive correlation between forecast_yield and received_price. However, some states have lower correlation values, sometimes the relationship is even inverse i.e. CONNECTICUIT, MAINE, MASSACHUSSETTS, etc.
+#Importantly, for most/all the states where cor_forecast is negative, there appears significant gaps in the data 
+#NOTE: 3 states where a correlation could not be calculated  
+
+removed_states <- state_correlations %>%
+  filter(is.na(cor_forecast) | cor_forecast < 0) %>%
+  pull(state_name)
+
+filtered_state_correlations <- state_correlations %>%
+  filter(!is.na(cor_forecast) & cor_forecast >= 0)
+
+print(removed_states)
+#removed_states = CONNECTICUIT, HAWAII, MAINE, MASSACHUSETTS, NEVADA, NEW HAMPSHIRE, "OTHER STATES", RHODE ISLAND, VERMONT 
+print(filtered_state_correlations)
+
+f_state_correlations_vec <- filtered_state_correlations$cor_forecast
+print(f_state_correlations_vec)
+```
+
+```{r}
+#5 - CRITICAL DATA QUALITY ISSUES TO FORECASTING TASK
+
+#Not all 50 states have survey data for all years 1950 - 2018. Hawaii is not included at all.
+#In terms of census data, Hawaii only has data for 4 of the census years.
+#In my error calculations for question 2, only data from 41 states was considered.
+#In terms of price_received data, gaps exist in the same states where they are present for survey data. 
+#This causes potential problems for the forecasting task as data from some states will be excluded and therefore the national level forecast will not be entirely representative. Further illustration of the data quality issues -> 
+
+survey_years <- 1950:2017
+survey_temp <- df_sans_constants %>%
+  filter(source_desc == "SURVEY")
+
+survey_temp %>%
+  group_by(state_name) %>%
+  summarize(years = list(sort(unique(year)))) %>%
+  print(n = Inf)
+#Missing years for CONNECTICUT, MAINE, MASSACHUSETTS, NEVADA, NEW HAMPSHIRE, OTHER STATES, RHODE ISLAND, AND VERMONT 
+#No Hawaii
+#Rest are 69 (anticipated value)
+
+census_years <- c(1997, 2002, 2007, 2012, 2017)
+census_temp <- df_sans_constants %>%
+  filter(source_desc == "CENSUS")
+
+census_temp %>%
+  group_by(state_name) %>%
+  summarize(years = list(sort(unique(year)))) %>%
+  print(n = Inf)
+#Missing years for HAWAII (only 4 instead of 5)
+
+#For PRICE DATA
+pricedf_sans_constants %>%
+  group_by(state_name) %>%
+  summarize(years = list(sort(unique(year)))) %>%
+  print(n = Inf)
+#Missing years for: CONNECTICUT, MAINE, MASSACHUSETTS, NEVADA, NEW HAMPSHIRE, RHODE ISLAND, VERMONT 
+#^Essentially the same as the survey data + ALASKA and HAWAII
+```
+
+```{r}
+#6 - SPECIFYING PARAMETERS OF FORECAST MODEL ON CORN YIELDS
+
+#My forecasting model will take the 41 states that "have sufficient data"
+#The variation in correlations show that in some states, forecast_yield may have a greater influence on price_received than in others. For this reason, I believe forecasting at the state level and then aggregating the individual state forecasts would more improve accuracy of the forecast model by accounting for state-specific relationships between price_received and forecast_yield. 
+
+#My training data will be from the years 1950 to 2017. My forecasted years will be 2018 to 2023. I will compare against real recorded values for price_received for the years 2018 to 2023. 
+```
+
+```{r}
+#7 - EXPLORING THE RELATIONSHIP BETWEEN CORN PRICES AND LAND REPORTED FOR AGRICULTURAL USE
+
+#QUERYING FOR "CORN - AREA PLANTED"
+year_start <- 1950
+year_end <- 2017
+years <- year_start:year_end
+names(years) <- rep('year', length(years))
+
+short_descs <- c("CORN - ACRES PLANTED")
+names(short_descs) <- rep('short_desc', length(short_descs))
+params <- list(sector_desc="CROPS",
+               commodity_desc="CORN",
+               group_desc="FIELD CROPS",
+               domain_desc="TOTAL",
+               agg_level_desc="STATE",
+               freq_desc = "ANNUAL",
+               key=apiKey)
+params <- c(years, short_descs, params)
+out = GET(paste(URL, 'get_counts', sep=""),
+          accept_json(),
+          query=params)
+est_rows = content(out)[['count']]
+if(est_rows > 50000){
+    print(paste("too many records, estimating ", est_rows, 
+                " data call will fail"))
+} else {
+    print(paste('Estimated ', est_rows, ' rows of data'))
+}
+
+usda_resp <- GET(url=paste(URL, 'api_GET', sep=""),
+                 query=params)
+usda_resp$status_code == 200
+data <- content(usda_resp)[['data']]
+
+headers <- names(data[[1]])
+acres_planted_data <- as.data.frame(do.call(rbind, lapply(data, function(x) unlist(x[headers]))))
+
+acres_planted_data <- acres_planted_data %>%
+  group_by(state_name) %>%
+  arrange(year, .by_group = TRUE) %>%
+  ungroup()
+
+constant_vals_planted <- sapply(acres_planted_data, function(x) length(unique(x))) == 1
+acres_planted_data1 <- acres_planted_data[, !constant_vals_planted]
+
+#Changing the Value column to doubles and renaming 
+acres_planted_data1$Value <- as.numeric(gsub(",", "", acres_planted_data1$Value))
+acres_planted_data1 <- acres_planted_data1 %>% rename(area_planted = Value)
+
+#Filtering out observations take make n across states equal
+acres_planted_filtered <- acres_planted_data1 %>%
+  filter(reference_period_desc == "YEAR")
+
+
+#DETERMINING STATES WITH THE LARGEST AVERAGE ACRES PLANTED OVER THE GIVEN TIMEFRAME
+state_acres_summary <- acres_planted_filtered %>%
+  group_by(state_name) %>%
+  summarize(
+    mean_acres_planted = mean(area_planted, na.rm = TRUE),
+    sd_acres_planted = sd(area_planted, na.rm = TRUE),
+    n_years = n(),
+    se_acres_planted = sd_acres_planted / sqrt(n_years)
+  ) %>%
+  arrange(desc(mean_acres_planted))
+print(state_acres_summary)
+#Nevada missing entries 
+
+#Adding to combined_price_df, but ignoring state and year combinations in acres_planted_filtered but not in combined_price_df
+yield_price_acres_df <- combined_price_df %>%
+  left_join(acres_planted_filtered %>% select(year, state_name, area_planted),
+            by = c("year", "state_name"))
+
+#INVESTIGATING IOWA - state with largest average acreage of corn planted 
+iowa_data <- yield_price_acres_df %>%
+  filter(state_name == "IOWA")
+print(iowa_data)
+
+iowa_cor1 <- cor(iowa_data$price_received, iowa_data$area_planted, use = "complete.obs")
+print(iowa_cor1)
+mod1_iowa <- lm(area_planted ~ price_received, data = iowa_data)
+summary(mod1_iowa)
+
+#^Relationship is shown to be positive - as price increases, so does area_planted. The relationship is shown to be significant for the state of Iowa. However, this is an extremely simple regression, not at all conclusive, meant to invite further analysis. I.e. a lagged regression. Additionally, a generalization cannot be made to the national level based on this analysis. 
+```
+
+```{r}
+#8 - PRODUCING AND JUSTIFYING VARIOUS FORECAST MODELS
+
+#Because there is temporal autocorrelation present within the data for price_received, I will build starting from an ARIMA model. Further justification for ARIMA model: prices are subject to seasonal/temporal effects.
+
+#Independent variables I'm considering: 
+#Corn yield 
+#Acres planted
+#Inflation rate
+
+#DATA CLEANING/STRUCTURING
+excluded_states <- c("CONNECTICUT", "HAWAII", "MAINE", "MASSACHUSETTS", "NEVADA", "NEW HAMPSHIRE", "OTHER STATES", "RHODE ISLAND", "VERMONT")
+yield_price_acres_filtered <- yield_price_acres_df %>%
+  filter(!state_name %in% excluded_states)
+yield_price_acres_filtered <- yield_price_acres_filtered %>%
+  filter(year >= 1950 & year <= 2017)
+
+
+#Model 1: Basic ARIMA model
+#Auto generated p, d, and q parameters
+state_forecasts <- list()
+for (state in unique(yield_price_acres_filtered$state_name)) {
+  state_data <- yield_price_acres_filtered %>% filter(state_name == state)
+  state_ts <- ts(state_data$price_received, start = 1950)
+  
+  model <- auto.arima(state_ts)
+  
+  forecast_state <- forecast(model, h = 6)
+  
+  state_forecasts[[state]] <- data.frame(
+    year = 2018:2023, 
+    state_name = state, 
+    price_forecast = as.numeric(forecast_state$mean)
+  )
+}
+all_state_forecasts <- bind_rows(state_forecasts)
+
+#COMBINING INTO NATIONAL FORECAST
+national_forecast_1 <- all_state_forecasts %>%
+  group_by(year) %>%
+  summarize(national_price_forecast = mean(price_forecast, na.rm = TRUE))
+print(national_forecast_1)
+
+#Model predicts reasonably well for 2018, 2019, and 2020. But for all COVID years where there was a major exogenous shock, the model does not do well. 
+
+
+#Model 2: ARIMAX model (including variables for inflation and forecast_yield)
+#Data cleaning/structuring
+inflation_data_raw <- read.csv("/Users/jayumshu/Downloads/FPCPITOTLZGUSA.csv")
+inflation_data_raw <- as.data.frame(inflation_data_raw)
+inflation_data_raw <- inflation_data_raw %>% rename(inflation_rate = FPCPITOTLZGUSA)
+
+cpi_data_raw <- read.csv("/Users/jayumshu/Downloads/CPIAUCSL.csv")
+cpi_data_raw <- as.data.frame(cpi_data_raw)
+cpi_data_raw <- cpi_data_raw %>% rename(cpi = CPIAUCSL)
+cpi_january <- cpi_data_raw %>%
+  filter(month(DATE) == 1)
+cpi_january <- cpi_january %>%
+  mutate(YEAR = year(DATE)) %>%
+  arrange(YEAR) %>%
+  filter(YEAR >= 1949 & YEAR <= 1959)
+cpi_january <- cpi_january %>% 
+  mutate(inflation_rate = (cpi - lag(cpi)) / lag(cpi) * 100)
+cpi_january <- cpi_january %>% rename(year = YEAR)
+
+inflation_data_raw <- inflation_data_raw %>%
+  mutate(year = year(DATE))
+
+inflation_data_raw <- inflation_data_raw %>% select(-DATE)
+cpi_january <- cpi_january %>% select(-c(DATE, cpi))
+
+inflation_data_combined <- bind_rows(inflation_data_raw, cpi_january)
+inflation_data_combined <- inflation_data_combined %>%
+  arrange(year)
+
+yield_price_acres_filtered$year <- as.double(yield_price_acres_filtered$year)
+arimax_data <- yield_price_acres_filtered %>%
+  left_join(inflation_data_combined %>% select(year, inflation_rate), by = "year")
+print(arimax_data[1:10, ])
+
+#Modeling 
+arimax_state_forecasts <- list()
+for (state in unique(arimax_data$state_name)) {
+  state_data1 <- arimax_data %>% filter(state_name == state)
+  
+  state_ts1 <- ts(state_data1$price_received, start = 1950)
+  
+  xreg <- as.matrix(state_data1 %>% select(forecast_yield, inflation_rate))
+  model_x <- auto.arima(state_ts1, xreg = xreg)
+  future_xreg <- matrix(ncol = 2, nrow = 6)
+  colnames(future_xreg) <- c("forecast_yield", "inflation_rate")
+  
+  future_xreg[, "forecast_yield"] <- tail(state_data1$forecast_yield, 1)
+  future_xreg[, "inflation_rate"] <- tail(state_data1$inflation_rate, 1)
+  
+  forecast_state1 <- forecast(model_x, xreg = future_xreg, h = 6)
+  
+  arimax_state_forecasts[[state]] <- data.frame(
+    year = 2018:2023,
+    state_name = state,
+    price_forecast = as.numeric(forecast_state1$mean),
+    lower_bound = as.numeric(forecast_state1$lower[, 2]),
+    upper_bound = as.numeric(forecast_state1$upper[, 2])
+  )
+}
+arimax_all_state_forecasts <- bind_rows(arimax_state_forecasts)
+#print(arimax_all_state_forecasts)
+
+national_forecast_2 <- arimax_all_state_forecasts %>%
+  group_by(year) %>%
+  summarize(national_price_forecast = mean(price_forecast, na.rm = TRUE),
+            lower_bound = mean(lower_bound, na.rm = TRUE),
+            upper_bound = mean(upper_bound, na.rm = TRUE))
+print(national_forecast_2)
+
+#NOTE: Applying national level inflation rates to state level data may be contributing to biased prediction. Further analysis would use data for state-level inflation instead of national level inflation. 
+
+
+#Model 3: Arimax WITHOUT inflation and just forecast yield 
+arimax_state_forecasts2 <- list()
+for (state in unique(arimax_data$state_name)) {
+  state_data2 <- arimax_data %>% filter(state_name == state)
+  
+  state_ts2 <- ts(state_data2$price_received, start = 1950)
+  
+  xreg2 <- as.matrix(state_data2 %>% select(forecast_yield))
+  model_x1 <- auto.arima(state_ts2, xreg = xreg2)
+  future_xreg1 <- matrix(ncol = 1, nrow = 6)
+  colnames(future_xreg1) <- c("forecast_yield")
+  
+  future_xreg1[, "forecast_yield"] <- tail(state_data2$forecast_yield, 1)
+
+  forecast_state2 <- forecast(model_x1, xreg = future_xreg1, h = 6)
+  
+  arimax_state_forecasts2[[state]] <- data.frame(
+    year = 2018:2023,
+    state_name = state,
+    price_forecast = as.numeric(forecast_state2$mean),
+    lower_bound = as.numeric(forecast_state2$lower[, 2]),
+    upper_bound = as.numeric(forecast_state2$upper[, 2])
+    #2nd column represents 95%
+  )
+}
+arimax_all_state_forecasts2 <- bind_rows(arimax_state_forecasts2)
+#print(arimax_all_state_forecasts2)
+
+national_forecast_3 <- arimax_all_state_forecasts2 %>%
+  group_by(year) %>%
+  summarize(
+    national_price_forecast = mean(price_forecast, na.rm = TRUE),
+    lower_bound = mean(lower_bound, na.rm = TRUE),
+    upper_bound = mean(upper_bound, na.rm = TRUE))
+print(national_forecast_3)
+
+
+#MODEL EVALUATION - ACCURACY (Comparing predicted prices to actual prices for years 2018-2023; ideally, further cross-validation would be performed)
+year <- 2018:2023
+price_received <- c(3.47, 3.75, 3.5, 5.4, 6.76, 5.95)
+actual_national_forecast_values <- data.frame(year, price_received)
+
+#MEAN SQUARED ERROR
+MSE1 <- mean((national_forecast_1$national_price_forecast - actual_national_forecast_values$price_received)^2)
+RMSE1 <- sqrt(MSE1)
+MSE2 <- mean((national_forecast_2$national_price_forecast - actual_national_forecast_values$price_received)^2)
+RMSE2 <- sqrt(MSE2)
+MSE3 <- mean((national_forecast_3$national_price_forecast - actual_national_forecast_values$price_received)^2)
+RMSE3 <- sqrt(MSE3)
+print(MSE1)
+print(RMSE1)
+print(MSE2)
+print(RMSE2)
+print(MSE3)
+print(RMSE3)
+#Model 1 (normal ARIMA model) has lowest MSE and RMSE here 
+
+#Just considering 2018-2020
+MSE15 <- mean((national_forecast_1$national_price_forecast[1:3] - actual_national_forecast_values$price_received[1:3])^2)
+RMSE15 <- sqrt(MSE15)
+MSE25 <- mean((national_forecast_2$national_price_forecast[1:3] - actual_national_forecast_values$price_received[1:3])^2)
+RMSE25 <- sqrt(MSE25)
+MSE35 <- mean((national_forecast_3$national_price_forecast[1:3] - actual_national_forecast_values$price_received[1:3])^2)
+RMSE35 <- sqrt(MSE35)
+print(MSE15)
+print(RMSE15)
+print(MSE25)
+print(RMSE25)
+print(MSE35)
+print(RMSE35)
+
+#Model 2 and model 3 are pretty comparable. But I argue that model 2 is the best forecasting model here in terms of accuracy because it has slightly lower MSE and RMSE values for the first 3 prediction years (before COVID, where an unexpected exogenous shock inflated prices greatly). In the future, I would like to explore what a forecasting model would look like incorporating A) state-level inflation values and B) data for inflation and forecast_yield for 2018:2023 instead of also forecasting values for these exogenous variables. I believe this would lead to more accurate prediction for the years 2021, 2022, and 2023. Future exploration should also include more comprehensive analysis regarding uncertainty. 
+```
+
+
+
+
